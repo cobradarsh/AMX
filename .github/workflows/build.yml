@@ -1,0 +1,36 @@
+name: Build AMScreen
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Install build tools
+        run: brew install ldid make xz dpkg
+
+      - name: Install Theos and an iOS SDK
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$THEOS"
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          SDK=$(ls -d /tmp/sdks/iPhoneOS16*.sdk 2>/dev/null | sort -V | tail -1)
+          [ -n "$SDK" ] || SDK=$(ls -d /tmp/sdks/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "Using $SDK"
+          cp -R "$SDK" "$THEOS/sdks/"
+
+      - name: Build rootless package
+        working-directory: src
+        run: gmake package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AMScreen-deb
+          path: src/packages/*.deb
