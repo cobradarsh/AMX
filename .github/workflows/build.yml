@@ -6,25 +6,48 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    env:
-      THEOS: ${{ github.workspace }}/theos
+    # Xcode's toolchain is required: only it emits the new arm64e ABI that
+    # SpringBoard on iOS 14+ will load. The Linux toolchain emits the old ABI.
+    runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           path: src
 
-      - name: Install Theos, the iOS toolchain and an SDK
-        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+      - name: Install build tools
+        run: brew install ldid make dpkg xz
 
-      - name: Show installed SDKs
-        run: ls "$THEOS/sdks"
+      - name: Install Theos and the roothide Theos fork
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          git clone --recursive --depth=1 https://github.com/roothide/theos.git "$RUNNER_TEMP/theos-roothide"
 
-      - name: Build rootless package
+      - name: Build rootless package (Dopamine)
         working-directory: src
-        run: make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+        run: gmake clean package FINALPACKAGE=1 THEOS="$RUNNER_TEMP/theos" THEOS_PACKAGE_SCHEME=rootless
+
+      - name: Build roothide package (Dopamine-roothide)
+        continue-on-error: true
+        working-directory: src
+        run: gmake clean package FINALPACKAGE=1 THEOS="$RUNNER_TEMP/theos-roothide" THEOS_PACKAGE_SCHEME=roothide
+
+      - name: Show arm64e ABI of each package
+        working-directory: src
+        run: |
+          for deb in packages/*.deb; do
+            rm -rf /tmp/x && mkdir /tmp/x && dpkg-deb -x "$deb" /tmp/x
+            echo "== $deb"
+            lipo -detailed_info "$(find /tmp/x -name AMScreen.dylib)"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: AMScreen-deb
-          path: src/packages/*.deb
+          name: AMScreen-rootless
+          path: src/packages/*_iphoneos-arm64.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AMScreen-roothide
+          path: src/packages/*_iphoneos-arm64e.deb
+          if-no-files-found: warn
