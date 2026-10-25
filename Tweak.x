@@ -117,6 +117,20 @@ static void AMSMaybeForceAnswerWhenLocked(void) {
     });
 }
 
+// While locked, the system's own call screen renders in the lock screen's
+// secure layer, above any window we create. So instead of out-leveling it, we
+// suppress that presentation (same hook CallHider uses) whenever we're locked
+// with a call we will handle, leaving our own screen as the only call UI.
+@interface SBInCallPresentationManager : NSObject @end
+
+static BOOL AMSShouldSuppressNativeCallUI(void) {
+    if (!AMSLocked()) return NO;      // unlocked: our window simply layers on top
+    if (!AMSCenter()) return NO;      // AM not present -> never hide the only call UI
+    for (TUCall *c in AMSCallCenter().currentCalls)
+        if (!c.isOutgoing && (c.status == kCallRinging || c.status == kCallActive)) return YES;
+    return NO;
+}
+
 static TUCall *AMSAnsweredIncomingCall(void) {
     TUCallCenter *tu = AMSCallCenter();
     for (TUCall *call in tu.currentCalls) {
@@ -408,6 +422,22 @@ static NSString *AMSString(id value) {
 
 %end
 
+%group PresHook
+%hook SBInCallPresentationManager
+- (void)inCallPresentationRequestServer:(id)server clientWithIdentifier:(id)ident
+       requestsPresentationWithConfiguration:(id)config completion:(void (^)(id))completion {
+    @try {
+        if (AMSShouldSuppressNativeCallUI()) {
+            AMSLog(@"suppressing native call UI (locked) so AMScreen is shown");
+            if (completion) completion(nil);
+            return;
+        }
+    } @catch (__unused NSException *e) {}
+    %orig;
+}
+%end
+%end
+
 #pragma mark Darwin notifications posted by AnsweringMachine (any process)
 
 static void AMSOnAutoAnswered(CFNotificationCenterRef c, void *o, CFStringRef name, const void *obj, CFDictionaryRef info) {
@@ -441,6 +471,8 @@ static void AMSObserve(const char *name, CFNotificationCallback cb) {
 %ctor {
     if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"]) return;
     AMSLog(@"loaded into SpringBoard");
+
+    %init(PresHook);   // suppress the native lock-screen call UI when we take over
 
     AMSObserve(AM_NOTIFY("callAutoAnswered"), AMSOnAutoAnswered);
     AMSObserve(AM_NOTIFY("greetingFinished"), AMSOnGreetingFinished);
