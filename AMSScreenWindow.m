@@ -234,8 +234,10 @@ static UIStackView *AMSCaptioned(UIView *control, UILabel *caption) {
     AMSScreenWindow *w = scene ? [[self alloc] initWithWindowScene:scene]
                                : [[self alloc] initWithFrame:UIScreen.mainScreen.bounds];
     w.frame = UIScreen.mainScreen.bounds;
-    // Above the lock screen, banners and the InCallService overlay.
-    w.windowLevel = 2050;
+    // Must sit ABOVE the lock screen (CoverSheet), not just banners/InCall.
+    // 2050 showed only while unlocked; a very high level keeps it on top while
+    // locked too (paired with the secure-context overrides below).
+    w.windowLevel = (UIWindowLevel)10000000;
     w.backgroundColor = UIColor.clearColor;
     w->_screenController = [AMSScreenViewController new];
     w.rootViewController = w->_screenController;
