@@ -193,6 +193,11 @@ static NSString *AMSString(id value) {
 }
 
 - (void)present {
+    // CallHider: never show the screen for a hidden caller (AM still records).
+    if (AMSCallHiddenByCallHider(AMSIncomingOrActiveCall())) {
+        AMSLog(@"not presenting screen: CallHider-hidden caller (AM still records)");
+        return;
+    }
     if (!self.window) {
         self.window = [AMSScreenWindow makeWindow];
         self.window.screenController.delegate = self;
@@ -318,12 +323,8 @@ static NSString *AMSString(id value) {
 %hook AMCenter
 
 - (void)autoAnswerCall {
-    // CallHider: leave hidden callers alone — do not auto-answer them.
-    TUCall *candidate = AMSIncomingOrActiveCall();
-    if (AMSCallHiddenByCallHider(candidate)) {
-        AMSLog(@"skipping auto-answer: caller is CallHider-hidden (%@)", candidate.displayName ?: @"?");
-        return;                         // no %orig -> AnsweringMachine does not pick up
-    }
+    // CallHider: still let AnsweringMachine auto-answer & record hidden callers,
+    // but the screen/alert is suppressed below (callWasAutoAnswered / present).
     AMSLog(@"-[AMCenter autoAnswerCall]");
     %orig;
     [[AMSController shared] callWasAutoAnswered];
