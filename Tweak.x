@@ -73,6 +73,49 @@ static TUCallCenter *AMSCallCenter(void) {
     return [(id)objc_getClass("TUCallCenter") sharedInstance];
 }
 
+// --- Screen-off / locked auto-answer -----------------------------------------
+// On iOS 16, AnsweringMachine often doesn't auto-answer while the device is
+// locked (screen off). We detect a ringing call while locked and, if AM hasn't
+// picked up within a short delay, trigger its auto-answer ourselves.
+@interface SBLockScreenManager : NSObject
++ (instancetype)sharedInstance;
+- (BOOL)isUILocked;
+@end
+
+static NSString *AMSStatusName(int s) {
+    switch (s) { case 1: return @"active"; case 4: return @"ringing"; case 5: return @"disconnecting"; case 6: return @"ended"; default: return [NSString stringWithFormat:@"%d", s]; }
+}
+static BOOL AMSLocked(void) {
+    Class c = NSClassFromString(@"SBLockScreenManager");
+    id m = [c respondsToSelector:@selector(sharedInstance)] ? [c sharedInstance] : nil;
+    return [m respondsToSelector:@selector(isUILocked)] ? [m isUILocked] : NO;
+}
+static TUCall *AMSRingingCall(void) {
+    for (TUCall *c in AMSCallCenter().currentCalls)
+        if (!c.isOutgoing && c.status == kCallRinging) return c;
+    return nil;
+}
+
+static BOOL gForceScheduled = NO;
+static const double kAMSForceAnswerDelay = 8.0;   // seconds to wait before forcing
+
+static void AMSMaybeForceAnswerWhenLocked(void) {
+    if (gForceScheduled || !AMSLocked() || !AMSRingingCall()) return;
+    gForceScheduled = YES;
+    AMSLog(@"locked + ringing: scheduling forced auto-answer in %.0fs", kAMSForceAnswerDelay);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAMSForceAnswerDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        AMCenter *center = AMSCenter();
+        BOOL answered = [center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered];
+        TUCall *still = AMSRingingCall();
+        if (still && !answered && [center respondsToSelector:@selector(autoAnswerCall)]) {
+            AMSLog(@"forcing -[AMCenter autoAnswerCall] (locked call still ringing, AM did not answer)");
+            [center autoAnswerCall];
+        } else {
+            AMSLog(@"forced answer skipped (answered=%d stillRinging=%d)", answered, still != nil);
+        }
+    });
+}
+
 static TUCall *AMSAnsweredIncomingCall(void) {
     TUCallCenter *tu = AMSCallCenter();
     for (TUCall *call in tu.currentCalls) {
@@ -325,7 +368,7 @@ static NSString *AMSString(id value) {
 - (void)autoAnswerCall {
     // CallHider: still let AnsweringMachine auto-answer & record hidden callers,
     // but the screen/alert is suppressed below (callWasAutoAnswered / present).
-    AMSLog(@"-[AMCenter autoAnswerCall]");
+    AMSLog(@"-[AMCenter autoAnswerCall] (locked=%d)", AMSLocked());
     %orig;
     [[AMSController shared] callWasAutoAnswered];
 }
@@ -338,7 +381,11 @@ static NSString *AMSString(id value) {
 
 - (void)handleCallStatusChangedWithCall:(id)call {
     %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{ [[AMSController shared] evaluate]; });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!AMSAnyLiveCall()) gForceScheduled = NO;
+        AMSMaybeForceAnswerWhenLocked();
+        [[AMSController shared] evaluate];
+    });
 }
 
 - (void)listenToCaller:(id)sender {
@@ -403,7 +450,13 @@ static void AMSObserve(const char *name, CFNotificationCallback cb) {
     [[NSNotificationCenter defaultCenter] addObserverForName:@"TUCallCenterCallStatusChangedNotification"
                                                       object:nil
                                                        queue:NSOperationQueue.mainQueue
-                                                  usingBlock:^(NSNotification *n) { [[AMSController shared] evaluate]; }];
+                                                  usingBlock:^(NSNotification *n) {
+        for (TUCall *c in AMSCallCenter().currentCalls)
+            if (!c.isOutgoing) AMSLog(@"call status=%@ locked=%d", AMSStatusName(c.status), AMSLocked());
+        if (!AMSAnyLiveCall()) gForceScheduled = NO;
+        AMSMaybeForceAnswerWhenLocked();
+        [[AMSController shared] evaluate];
+    }];
 
     // Tweaks load alphabetically, so AnsweringMachineUI.dylib may not be loaded yet.
     dispatch_async(dispatch_get_main_queue(), ^{

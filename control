@@ -1,6 +1,6 @@
 Package: com.personal.amscreen
 Name: AMScreen
-Version: 0.2.1
+Version: 0.3.0
 Architecture: iphoneos-arm64
 Description: Call-screening screen companion for AnsweringMachine XS
 Maintainer: me
