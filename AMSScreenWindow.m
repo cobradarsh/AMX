@@ -234,10 +234,10 @@ static UIStackView *AMSCaptioned(UIView *control, UILabel *caption) {
     AMSScreenWindow *w = scene ? [[self alloc] initWithWindowScene:scene]
                                : [[self alloc] initWithFrame:UIScreen.mainScreen.bounds];
     w.frame = UIScreen.mainScreen.bounds;
-    // Must sit ABOVE the lock screen (CoverSheet), not just banners/InCall.
-    // 2050 showed only while unlocked; a very high level keeps it on top while
-    // locked too (paired with the secure-context overrides below).
-    w.windowLevel = (UIWindowLevel)10000000;
+    // Must sit ABOVE the lock screen (CoverSheet) AND the system's active-call
+    // UI that iOS shows on the lock screen. 10000000 cleared the lock screen but
+    // the native answered-call screen still layered on top, so go higher.
+    w.windowLevel = (UIWindowLevel)1000000000;
     w.backgroundColor = UIColor.clearColor;
     w->_screenController = [AMSScreenViewController new];
     w.rootViewController = w->_screenController;
