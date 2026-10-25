@@ -13,6 +13,7 @@
 
 @interface AMCenter : NSObject
 + (instancetype)sharedInstance;
+- (void)autoAnswerCall;
 - (BOOL)callAutoAnswered;
 - (NSString *)callerName;
 - (NSString *)statusString;
