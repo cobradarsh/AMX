@@ -22,10 +22,16 @@
 - (void)declineCurrentCall;
 @end
 
+@interface TUHandle : NSObject
+@property (nonatomic, readonly, copy) NSString *value;
+@end
+
 @interface TUCall : NSObject
 @property (nonatomic, readonly) int status;
 @property (nonatomic, readonly, copy) NSString *displayName;
 @property (nonatomic, readonly, getter=isOutgoing) BOOL outgoing;
+@property (nonatomic, readonly) TUHandle *handle;
+@property (nonatomic, readonly, copy) NSString *contactIdentifier;
 @end
 
 @interface TUCallCenter : NSObject
@@ -75,6 +81,50 @@ static TUCall *AMSAnsweredIncomingCall(void) {
     return nil;
 }
 
+// The call AnsweringMachine is about to / just did auto-answer: the incoming
+// (ringing) or freshly active call.
+static TUCall *AMSIncomingOrActiveCall(void) {
+    for (TUCall *call in AMSCallCenter().currentCalls) {
+        if (!call.isOutgoing && (call.status == kCallRinging || call.status == kCallActive)) return call;
+    }
+    return nil;
+}
+
+// --- CallHider integration -------------------------------------------------
+// Read CallHider's hidden-callers list from its shared preferences and decide
+// whether a caller should be left alone (NOT auto-answered). Keys mirror
+// CallHider/CHPrefs.h: app id com.cobradarsh.callhider, array "hiddenContacts"
+// of { id, name, numbers:[...] }.
+#define kCHAppID CFSTR("com.cobradarsh.callhider")
+
+static NSString *AMSDigits(NSString *raw) {
+    if (![raw isKindOfClass:NSString.class] || raw.length == 0) return nil;
+    NSMutableString *d = [NSMutableString string];
+    for (NSUInteger i = 0; i < raw.length; i++) { unichar c = [raw characterAtIndex:i]; if (c >= '0' && c <= '9') [d appendFormat:@"%C", c]; }
+    if (d.length == 0) return nil;
+    return d.length > 10 ? [d substringFromIndex:d.length - 10] : d;
+}
+
+static BOOL AMSCallHiddenByCallHider(TUCall *call) {
+    if (!call) return NO;
+    CFPreferencesAppSynchronize(kCHAppID);
+    id en = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabled"), kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (en != nil && ![en boolValue]) return NO;                 // CallHider disabled
+    NSArray *hidden = (__bridge_transfer NSArray *)CFPreferencesCopyValue(CFSTR("hiddenContacts"), kCHAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (![hidden isKindOfClass:NSArray.class] || hidden.count == 0) return NO;
+
+    NSString *cid = nil, *num = nil;
+    @try { cid = call.contactIdentifier; num = AMSDigits(call.handle.value); } @catch (__unused NSException *e) { return NO; }
+    for (NSDictionary *e in hidden) {
+        if (![e isKindOfClass:NSDictionary.class]) continue;
+        id eid = e[@"id"];
+        if (cid.length && [eid isKindOfClass:NSString.class] && [eid isEqualToString:cid]) return YES;
+        if (num.length) for (NSString *n in e[@"numbers"])
+            if ([n isKindOfClass:NSString.class] && n.length && ([num hasSuffix:n] || [n hasSuffix:num])) return YES;
+    }
+    return NO;
+}
+
 static BOOL AMSAnyLiveCall(void) {
     TUCallCenter *tu = AMSCallCenter();
     for (TUCall *call in tu.currentCalls) {
@@ -110,6 +160,12 @@ static NSString *AMSString(id value) {
 }
 
 - (void)callWasAutoAnswered {
+    // Belt-and-suspenders: never raise the screen for a CallHider-hidden caller,
+    // even if AnsweringMachine answered via a path we didn't intercept.
+    if (AMSCallHiddenByCallHider(AMSIncomingOrActiveCall())) {
+        AMSLog(@"ignoring auto-answer screen for CallHider-hidden caller");
+        return;
+    }
     AMSLog(@"auto-answer detected");
     self.armed = YES;
     if (!self.answeredAt) self.answeredAt = [NSDate date];
@@ -262,6 +318,12 @@ static NSString *AMSString(id value) {
 %hook AMCenter
 
 - (void)autoAnswerCall {
+    // CallHider: leave hidden callers alone — do not auto-answer them.
+    TUCall *candidate = AMSIncomingOrActiveCall();
+    if (AMSCallHiddenByCallHider(candidate)) {
+        AMSLog(@"skipping auto-answer: caller is CallHider-hidden (%@)", candidate.displayName ?: @"?");
+        return;                         // no %orig -> AnsweringMachine does not pick up
+    }
     AMSLog(@"-[AMCenter autoAnswerCall]");
     %orig;
     [[AMSController shared] callWasAutoAnswered];
