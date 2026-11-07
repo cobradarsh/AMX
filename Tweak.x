@@ -4,12 +4,19 @@
 // AMCallWindow never appears on iOS 16 because it isn't attached to a UIWindowScene.
 // We show our own window when AM auto-answers and route the buttons back to AM's
 // controller (AMCenter), so AM's audio hooks keep handling mute/listen/record.
+//
+// Neither AM nor our locked-screen fallback may auto-answer a second (waiting)
+// call while you're already on a call: that would drop the call you're on.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <notify.h>
 #import "AMSScreenWindow.h"
 
 #define AM_NOTIFY(name) "net.limneos.answeringmachine." name
+
+// Published by SpringBoard, read by every process AM's auto-answer may run in.
+static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting";
 
 @interface AMCenter : NSObject
 + (instancetype)sharedInstance;
@@ -42,7 +49,7 @@
 @end
 
 // TUCallStatus values.
-enum { kCallActive = 1, kCallRinging = 4, kCallDisconnecting = 5, kCallDisconnected = 6 };
+enum { kCallActive = 1, kCallHeld = 2, kCallSending = 3, kCallRinging = 4, kCallDisconnecting = 5, kCallDisconnected = 6 };
 
 static NSString *const kLogPath = @"/var/mobile/Library/Logs/AMScreen.log";
 
@@ -54,7 +61,7 @@ static void AMSLog(NSString *format, ...) {
     va_end(args);
     NSLog(@"[AMScreen] %@", msg);
 
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    NSString *line = [NSString stringWithFormat:@"%@ [%s] %@\n", [NSDate date], getprogname(), msg];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kLogPath];
     if (!fh) {
         [line writeToFile:kLogPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
@@ -72,6 +79,39 @@ static AMCenter *AMSCenter(void) {
 
 static TUCallCenter *AMSCallCenter(void) {
     return [(id)objc_getClass("TUCallCenter") sharedInstance];
+}
+
+// --- Call waiting ------------------------------------------------------------
+// An incoming call is ringing while another call is already up (talking, on hold
+// or dialing). Auto-answering then would drop the call in progress.
+static BOOL AMSCallWaiting(void) {
+    BOOL ringing = NO, established = NO;
+    for (TUCall *call in AMSCallCenter().currentCalls) {
+        int status = call.status;
+        if (status == kCallRinging && !call.isOutgoing) ringing = YES;
+        else if (status == kCallActive || status == kCallHeld || status == kCallSending) established = YES;
+    }
+    return ringing && established;
+}
+
+static void AMSPublishCallWaiting(void) {
+    static int token = NOTIFY_TOKEN_INVALID;
+    if (token == NOTIFY_TOKEN_INVALID && notify_register_check(kCallWaitingNotify, &token) != NOTIFY_STATUS_OK) return;
+    uint64_t waiting = AMSCallWaiting(), previous = 0;
+    notify_get_state(token, &previous);
+    if (waiting == previous) return;
+    notify_set_state(token, waiting);
+    notify_post(kCallWaitingNotify);
+    AMSLog(@"call waiting: %d", (int)waiting);
+}
+
+static BOOL AMSPublishedCallWaiting(void) {
+    int token;
+    uint64_t waiting = 0;
+    if (notify_register_check(kCallWaitingNotify, &token) != NOTIFY_STATUS_OK) return NO;
+    notify_get_state(token, &waiting);
+    notify_cancel(token);
+    return waiting != 0;
 }
 
 // --- Screen-off / locked auto-answer -----------------------------------------
@@ -102,13 +142,18 @@ static const double kAMSForceAnswerDelay = 8.0;   // seconds to wait before forc
 
 static void AMSMaybeForceAnswerWhenLocked(void) {
     if (gForceScheduled || !AMSLocked() || !AMSRingingCall()) return;
+    // A second call ringing while you're on a call: leave it alone. Otherwise the
+    // forced answer would make AM drop the call you're on to take this one.
+    if (AMSCallWaiting()) return;
     gForceScheduled = YES;
     AMSLog(@"locked + ringing: scheduling forced auto-answer in %.0fs", kAMSForceAnswerDelay);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAMSForceAnswerDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         AMCenter *center = AMSCenter();
         BOOL answered = [center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered];
         TUCall *still = AMSRingingCall();
-        if (still && !answered && [center respondsToSelector:@selector(autoAnswerCall)]) {
+        if (AMSCallWaiting()) {
+            AMSLog(@"forced answer skipped: another call is in progress");
+        } else if (still && !answered && [center respondsToSelector:@selector(autoAnswerCall)]) {
             AMSLog(@"forcing -[AMCenter autoAnswerCall] (locked call still ringing, AM did not answer)");
             [center autoAnswerCall];
         } else {
@@ -205,6 +250,10 @@ static NSString *AMSString(id value) {
 }
 
 - (void)callWasAutoAnswered {
+    if (AMSCallWaiting()) {
+        AMSLog(@"auto-answer signal ignored: already on another call");
+        return;
+    }
     // Belt-and-suspenders: never raise the screen for a CallHider-hidden caller,
     // even if AnsweringMachine answered via a path we didn't intercept.
     if (AMSCallHiddenByCallHider(AMSIncomingOrActiveCall())) {
@@ -225,6 +274,7 @@ static NSString *AMSString(id value) {
         [self reset];
         return;
     }
+    if (AMSCallWaiting() && !self.armed) return;
     AMCenter *center = AMSCenter();
     BOOL amAnswered = self.armed || ([center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered]);
     if (amAnswered && !self.armed) {
@@ -361,19 +411,36 @@ static NSString *AMSString(id value) {
 
 @end
 
-#pragma mark Hooks into AnsweringMachine's controller (SpringBoard side)
+#pragma mark Hooks into AnsweringMachine's controller
 
-%group AMHooks
+static BOOL gIsSpringBoard;
+
+// Every process AnsweringMachineUI.dylib loads into: whichever one runs AM's
+// greeting-delay timer, a waiting call must not be auto-answered there.
+%group AMGuard
 
 %hook AMCenter
 
 - (void)autoAnswerCall {
+    if (AMSPublishedCallWaiting() || AMSCallWaiting()) {
+        AMSLog(@"-[AMCenter autoAnswerCall] blocked: already on another call");
+        return;
+    }
     // CallHider: still let AnsweringMachine auto-answer & record hidden callers,
     // but the screen/alert is suppressed below (callWasAutoAnswered / present).
     AMSLog(@"-[AMCenter autoAnswerCall] (locked=%d)", AMSLocked());
     %orig;
-    [[AMSController shared] callWasAutoAnswered];
+    if (gIsSpringBoard) [[AMSController shared] callWasAutoAnswered];
 }
+
+%end
+
+%end
+
+// SpringBoard only: drives the screening screen.
+%group AMHooks
+
+%hook AMCenter
 
 - (void)requestRemoteViewService {
     AMSLog(@"-[AMCenter requestRemoteViewService]");
@@ -384,6 +451,7 @@ static NSString *AMSString(id value) {
 - (void)handleCallStatusChangedWithCall:(id)call {
     %orig;
     dispatch_async(dispatch_get_main_queue(), ^{
+        AMSPublishCallWaiting();
         if (!AMSAnyLiveCall()) gForceScheduled = NO;
         AMSMaybeForceAnswerWhenLocked();
         [[AMSController shared] evaluate];
@@ -431,7 +499,10 @@ static void AMSOnStatusBarTapped(CFNotificationCenterRef c, void *o, CFStringRef
 }
 
 static void AMSOnStatusChanged(CFNotificationCenterRef c, void *o, CFStringRef name, const void *obj, CFDictionaryRef info) {
-    dispatch_async(dispatch_get_main_queue(), ^{ [[AMSController shared] evaluate]; });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AMSPublishCallWaiting();
+        [[AMSController shared] evaluate];
+    });
 }
 
 static void AMSObserve(const char *name, CFNotificationCallback cb) {
@@ -440,33 +511,41 @@ static void AMSObserve(const char *name, CFNotificationCallback cb) {
 }
 
 %ctor {
-    if (![NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"]) return;
-    AMSLog(@"loaded into SpringBoard");
+    gIsSpringBoard = [NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"];
 
-    AMSObserve(AM_NOTIFY("callAutoAnswered"), AMSOnAutoAnswered);
-    AMSObserve(AM_NOTIFY("greetingFinished"), AMSOnGreetingFinished);
-    AMSObserve(AM_NOTIFY("doubleHeightStatusBarTapped"), AMSOnStatusBarTapped);
-    AMSObserve(AM_NOTIFY("callStatusChanged"), AMSOnStatusChanged);
-    AMSObserve(AM_NOTIFY("stopAnsweringMachine"), AMSOnStatusChanged);
+    if (gIsSpringBoard) {
+        AMSLog(@"loaded into SpringBoard");
 
-    [[NSNotificationCenter defaultCenter] addObserverForName:@"TUCallCenterCallStatusChangedNotification"
-                                                      object:nil
-                                                       queue:NSOperationQueue.mainQueue
-                                                  usingBlock:^(NSNotification *n) {
-        for (TUCall *c in AMSCallCenter().currentCalls)
-            if (!c.isOutgoing) AMSLog(@"call status=%@ locked=%d", AMSStatusName(c.status), AMSLocked());
-        if (!AMSAnyLiveCall()) gForceScheduled = NO;
-        AMSMaybeForceAnswerWhenLocked();
-        [[AMSController shared] evaluate];
-    }];
+        AMSObserve(AM_NOTIFY("callAutoAnswered"), AMSOnAutoAnswered);
+        AMSObserve(AM_NOTIFY("greetingFinished"), AMSOnGreetingFinished);
+        AMSObserve(AM_NOTIFY("doubleHeightStatusBarTapped"), AMSOnStatusBarTapped);
+        AMSObserve(AM_NOTIFY("callStatusChanged"), AMSOnStatusChanged);
+        AMSObserve(AM_NOTIFY("stopAnsweringMachine"), AMSOnStatusChanged);
+
+        [[NSNotificationCenter defaultCenter] addObserverForName:@"TUCallCenterCallStatusChangedNotification"
+                                                          object:nil
+                                                           queue:NSOperationQueue.mainQueue
+                                                      usingBlock:^(NSNotification *n) {
+            for (TUCall *c in AMSCallCenter().currentCalls)
+                if (!c.isOutgoing) AMSLog(@"call status=%@ locked=%d", AMSStatusName(c.status), AMSLocked());
+            AMSPublishCallWaiting();
+            if (!AMSAnyLiveCall()) gForceScheduled = NO;
+            AMSMaybeForceAnswerWhenLocked();
+            [[AMSController shared] evaluate];
+        }];
+    }
 
     // Tweaks load alphabetically, so AnsweringMachineUI.dylib may not be loaded yet.
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (objc_getClass("AMCenter")) {
-            %init(AMHooks);
-            AMSLog(@"hooked AMCenter");
-        } else {
-            AMSLog(@"AMCenter not found - is AnsweringMachine XS installed and enabled?");
+        if (!objc_getClass("AMCenter")) {
+            if (gIsSpringBoard) AMSLog(@"AMCenter not found - is AnsweringMachine XS installed and enabled?");
+            return;
         }
+        %init(AMGuard);
+        if (gIsSpringBoard) {
+            %init(AMHooks);
+            AMSPublishCallWaiting();
+        }
+        AMSLog(@"hooked AMCenter");
     });
 }

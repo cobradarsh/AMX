@@ -15,6 +15,13 @@ call AM's own controller (`AMCenter`):
 | Hang up | `-[AMCenter declineCurrentCall]`, falling back to `TUCallCenter disconnectCall:` |
 | ⌄ (hide) | Hides the screen; tap AM's status-bar indicator to bring it back |
 
+While you're already on a call (talking, on hold or dialing), a second incoming
+call is never auto-answered: neither by AM's own timer (`-[AMCenter autoAnswerCall]`
+is blocked) nor by AMScreen's locked-screen fallback. The waiting call keeps
+ringing as normal. SpringBoard publishes the "call waiting" state through the
+`com.personal.amscreen.callwaiting` notify key, and the guard runs in every process
+AnsweringMachine's UI dylib loads into.
+
 ## Build (GitHub Actions)
 
 1. Create a **private** GitHub repo and push this folder to it.
