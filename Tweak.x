@@ -51,6 +51,9 @@ static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting
 // TUCallStatus values.
 enum { kCallActive = 1, kCallHeld = 2, kCallSending = 3, kCallRinging = 4, kCallDisconnecting = 5, kCallDisconnected = 6 };
 
+// Defined further down (CallHider integration); used by the locked-answer path above it.
+static BOOL AMSCallHiddenByCallHider(TUCall *call);
+
 static NSString *const kLogPath = @"/var/mobile/Library/Logs/AMScreen.log";
 
 static void AMSLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
