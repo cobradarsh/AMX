@@ -145,6 +145,8 @@ static void AMSMaybeForceAnswerWhenLocked(void) {
     // A second call ringing while you're on a call: leave it alone. Otherwise the
     // forced answer would make AM drop the call you're on to take this one.
     if (AMSCallWaiting()) return;
+    // CallHider-hidden callers are never answered by AM, forced or otherwise.
+    if (AMSCallHiddenByCallHider(AMSRingingCall())) { AMSLog(@"locked + ringing but caller is CallHider-hidden; not forcing"); return; }
     gForceScheduled = YES;
     AMSLog(@"locked + ringing: scheduling forced auto-answer in %.0fs", kAMSForceAnswerDelay);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAMSForceAnswerDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -426,8 +428,12 @@ static BOOL gIsSpringBoard;
         AMSLog(@"-[AMCenter autoAnswerCall] blocked: already on another call");
         return;
     }
-    // CallHider: still let AnsweringMachine auto-answer & record hidden callers,
-    // but the screen/alert is suppressed below (callWasAutoAnswered / present).
+    // CallHider: AnsweringMachine is DISABLED for hidden callers — never pick up.
+    TUCall *candidate = AMSRingingCall();
+    if (AMSCallHiddenByCallHider(candidate)) {
+        AMSLog(@"-[AMCenter autoAnswerCall] skipped: caller is CallHider-hidden (%@)", candidate.displayName ?: @"?");
+        return;                         // no %orig -> AM does not answer or record
+    }
     AMSLog(@"-[AMCenter autoAnswerCall] (locked=%d)", AMSLocked());
     %orig;
     if (gIsSpringBoard) [[AMSController shared] callWasAutoAnswered];
