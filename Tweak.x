@@ -154,6 +154,14 @@ static void AMSMaybeForceAnswerWhenLocked(void) {
     AMSLog(@"locked + ringing: scheduling forced auto-answer in %.0fs", kAMSForceAnswerDelay);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAMSForceAnswerDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         AMCenter *center = AMSCenter();
+        // If the phone was unlocked during the wait, you are present and handling
+        // the call yourself. Don't answer it from under you: leave the native
+        // ringing UI so you can accept or decline. (AM's own delay still applies.)
+        if (!AMSLocked()) {
+            AMSLog(@"forced answer skipped: device unlocked, user is handling the call");
+            gForceScheduled = NO;
+            return;
+        }
         BOOL answered = [center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered];
         TUCall *still = AMSRingingCall();
         if (AMSCallWaiting()) {

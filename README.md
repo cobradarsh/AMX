@@ -22,6 +22,11 @@ ringing as normal. SpringBoard publishes the "call waiting" state through the
 `com.personal.amscreen.callwaiting` notify key, and the guard runs in every process
 AnsweringMachine's UI dylib loads into.
 
+The locked-screen forced auto-answer only fires while the phone is still locked at
+the moment the timer elapses. If you unlock during the wait, the forced answer is
+skipped so the native ringing UI stays and you can accept or decline the call
+yourself (AnsweringMachine's own answer delay still applies).
+
 ## Build (GitHub Actions)
 
 1. Create a **private** GitHub repo and push this folder to it.
