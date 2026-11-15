@@ -27,6 +27,15 @@ the moment the timer elapses. If you unlock during the wait, the forced answer i
 skipped so the native ringing UI stays and you can accept or decline the call
 yourself (AnsweringMachine's own answer delay still applies).
 
+AnsweringMachine's own settings are honoured on every path. AM enforces its
+on/off switch and **Excluded Numbers** only when it decides whether to schedule
+`-[AMCenter autoAnswerCall]`; the method itself answers whatever is ringing. So
+AMScreen applies the same rules before forcing an answer, and inside its
+`autoAnswerCall` hook: AM switched off, or a caller in Excluded Numbers, is never
+answered. As in AM, a caller with a custom (per-contact) greeting is still answered
+even if excluded. Numbers are compared with AM's own matcher (formatting stripped,
+either number may contain the other), with a trailing-digits fallback.
+
 ## Build (GitHub Actions)
 
 1. Create a **private** GitHub repo and push this folder to it.

@@ -7,6 +7,10 @@
 //
 // Neither AM nor our locked-screen fallback may auto-answer a second (waiting)
 // call while you're already on a call: that would drop the call you're on.
+//
+// -[AMCenter autoAnswerCall] answers unconditionally; AM applies its own rules
+// (on/off switch, Excluded Numbers) only when deciding whether to schedule it.
+// Our fallback triggers it directly, so it has to apply those rules itself.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -20,6 +24,7 @@ static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting
 
 @interface AMCenter : NSObject
 + (instancetype)sharedInstance;
++ (NSString *)cleanedNumber:(NSString *)number;
 - (void)autoAnswerCall;
 - (BOOL)callAutoAnswered;
 - (NSString *)callerName;
@@ -40,6 +45,7 @@ static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting
 @property (nonatomic, readonly, getter=isOutgoing) BOOL outgoing;
 @property (nonatomic, readonly) TUHandle *handle;
 @property (nonatomic, readonly, copy) NSString *contactIdentifier;
+@property (nonatomic, readonly, copy) NSString *destinationID;
 @end
 
 @interface TUCallCenter : NSObject
@@ -53,6 +59,9 @@ enum { kCallActive = 1, kCallHeld = 2, kCallSending = 3, kCallRinging = 4, kCall
 
 // Defined further down (CallHider integration); used by the locked-answer path above it.
 static BOOL AMSCallHiddenByCallHider(TUCall *call);
+// Defined further down (AnsweringMachine's own rules); used by the locked-answer path above them.
+static BOOL AMSAnsweringMachineEnabled(void);
+static BOOL AMSCallExcludedByAnsweringMachine(TUCall *call);
 
 static NSString *const kLogPath = @"/var/mobile/Library/Logs/AMScreen.log";
 
@@ -150,6 +159,9 @@ static void AMSMaybeForceAnswerWhenLocked(void) {
     if (AMSCallWaiting()) return;
     // CallHider-hidden callers are never answered by AM, forced or otherwise.
     if (AMSCallHiddenByCallHider(AMSRingingCall())) { AMSLog(@"locked + ringing but caller is CallHider-hidden; not forcing"); return; }
+    // Forcing -autoAnswerCall must not answer callers AM itself would leave alone.
+    if (!AMSAnsweringMachineEnabled()) { AMSLog(@"locked + ringing but AnsweringMachine is switched off; not forcing"); return; }
+    if (AMSCallExcludedByAnsweringMachine(AMSRingingCall())) { AMSLog(@"locked + ringing but caller is in AM's Excluded Numbers; not forcing"); return; }
     gForceScheduled = YES;
     AMSLog(@"locked + ringing: scheduling forced auto-answer in %.0fs", kAMSForceAnswerDelay);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAMSForceAnswerDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -166,6 +178,9 @@ static void AMSMaybeForceAnswerWhenLocked(void) {
         TUCall *still = AMSRingingCall();
         if (AMSCallWaiting()) {
             AMSLog(@"forced answer skipped: another call is in progress");
+        } else if (!AMSAnsweringMachineEnabled() || AMSCallExcludedByAnsweringMachine(still)) {
+            // Re-checked here: the call ringing now may not be the one this timer was set for.
+            AMSLog(@"forced answer skipped: AnsweringMachine is off or the caller is in its Excluded Numbers");
         } else if (still && !answered && [center respondsToSelector:@selector(autoAnswerCall)]) {
             AMSLog(@"forcing -[AMCenter autoAnswerCall] (locked call still ringing, AM did not answer)");
             [center autoAnswerCall];
@@ -226,6 +241,88 @@ static BOOL AMSCallHiddenByCallHider(TUCall *call) {
             if ([n isKindOfClass:NSString.class] && n.length && ([num hasSuffix:n] || [n hasSuffix:num])) return YES;
     }
     return NO;
+}
+
+// --- AnsweringMachine's own rules ------------------------------------------
+// AM decides whether a caller gets the machine when it *schedules*
+// -autoAnswerCall; that method then answers whatever is ringing. Mirror the
+// rules for anything that triggers the answer directly:
+//   - AnsweringMachine switched off               -> never answer
+//   - caller has a custom (per-contact) greeting  -> answer, even if excluded
+//   - caller is in Settings > Excluded Numbers    -> never answer
+// Keys mirror AM's own lookups in its net.limneos.answeringmachine suite:
+// "enabled", "excludedNumbers" (array of numbers) and "contacts" (array of
+// custom greetings, each { address, ... }).
+#define kAMAppID CFSTR("net.limneos.answeringmachine")
+
+@interface NSArray (AMSAnsweringMachine)
+- (BOOL)containsAMPhoneNumber:(NSString *)number;   // AM's own matcher, present when its dylib is loaded
+@end
+
+static id AMSAnsweringMachinePref(CFStringRef key) {
+    return (__bridge_transfer id)CFPreferencesCopyValue(key, kAMAppID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+}
+
+static BOOL AMSAnsweringMachineEnabled(void) {
+    CFPreferencesAppSynchronize(kAMAppID);
+    id enabled = AMSAnsweringMachinePref(CFSTR("enabled"));
+    return enabled == nil || [enabled boolValue];    // AM's switch defaults to on
+}
+
+// The number AM itself looks a call up by ("PRIVATE" when the caller withheld it).
+static NSString *AMSCallerNumber(TUCall *call) {
+    NSString *number = nil;
+    @try {
+        if ([call respondsToSelector:@selector(destinationID)]) number = call.destinationID;
+        if (!number.length) number = call.handle.value;
+    } @catch (__unused NSException *e) {}
+    return number.length ? number : @"PRIVATE";
+}
+
+// AM's comparison: strip formatting from both numbers, then either may contain
+// the other, so "+91 98765 43210" matches "98765 43210". `lenient` also accepts
+// matching trailing digits, for anything AM's cleaner would miss.
+static BOOL AMSNumbersMatch(id a, id b, BOOL lenient) {
+    if (![a isKindOfClass:NSString.class] || ![b isKindOfClass:NSString.class]) return NO;
+    Class center = objc_getClass("AMCenter");
+    BOOL haveCleaner = [center respondsToSelector:@selector(cleanedNumber:)];
+    if (haveCleaner) {
+        NSString *ca = [center cleanedNumber:a], *cb = [center cleanedNumber:b];
+        if (ca.length && cb.length &&
+            ([ca rangeOfString:cb].location != NSNotFound || [cb rangeOfString:ca].location != NSNotFound)) return YES;
+    }
+    if (haveCleaner && !lenient) return NO;
+    NSString *da = AMSDigits(a), *db = AMSDigits(b);
+    return da.length >= 7 && db.length >= 7 && ([da hasSuffix:db] || [db hasSuffix:da]);
+}
+
+static BOOL AMSNumberIsExcluded(NSString *number) {
+    NSArray *excluded = AMSAnsweringMachinePref(CFSTR("excludedNumbers"));
+    if (![excluded isKindOfClass:NSArray.class] || excluded.count == 0) return NO;
+    if ([excluded respondsToSelector:@selector(containsAMPhoneNumber:)]) {
+        @try { if ([excluded containsAMPhoneNumber:number]) return YES; } @catch (__unused NSException *e) {}
+    }
+    for (id entry in excluded) {
+        if (AMSNumbersMatch(entry, number, YES)) return YES;
+    }
+    return NO;
+}
+
+static BOOL AMSNumberHasCustomGreeting(NSString *number) {
+    NSArray *contacts = AMSAnsweringMachinePref(CFSTR("contacts"));
+    if (![contacts isKindOfClass:NSArray.class]) return NO;
+    for (NSDictionary *entry in contacts) {
+        if ([entry isKindOfClass:NSDictionary.class] && AMSNumbersMatch(entry[@"address"], number, NO)) return YES;
+    }
+    return NO;
+}
+
+// YES when AM's settings say this caller must not get the answering machine.
+static BOOL AMSCallExcludedByAnsweringMachine(TUCall *call) {
+    if (!call) return NO;
+    CFPreferencesAppSynchronize(kAMAppID);
+    NSString *number = AMSCallerNumber(call);
+    return AMSNumberIsExcluded(number) && !AMSNumberHasCustomGreeting(number);
 }
 
 static BOOL AMSAnyLiveCall(void) {
@@ -444,6 +541,12 @@ static BOOL gIsSpringBoard;
     if (AMSCallHiddenByCallHider(candidate)) {
         AMSLog(@"-[AMCenter autoAnswerCall] skipped: caller is CallHider-hidden (%@)", candidate.displayName ?: @"?");
         return;                         // no %orig -> AM does not answer or record
+    }
+    // AM only honours Excluded Numbers by never scheduling this call, so honour
+    // them here too: whatever triggers the answer, an excluded caller is left alone.
+    if (AMSCallExcludedByAnsweringMachine(candidate)) {
+        AMSLog(@"-[AMCenter autoAnswerCall] skipped: caller is in AnsweringMachine's Excluded Numbers");
+        return;
     }
     AMSLog(@"-[AMCenter autoAnswerCall] (locked=%d)", AMSLocked());
     %orig;
