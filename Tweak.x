@@ -27,6 +27,8 @@ static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting
 + (NSString *)cleanedNumber:(NSString *)number;
 - (void)autoAnswerCall;
 - (BOOL)callAutoAnswered;
+- (BOOL)autoAnswering;
+- (BOOL)DNDState;
 - (NSString *)callerName;
 - (NSString *)statusString;
 - (UIButton *)sneakButton;
@@ -46,6 +48,7 @@ static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting
 @property (nonatomic, readonly) TUHandle *handle;
 @property (nonatomic, readonly, copy) NSString *contactIdentifier;
 @property (nonatomic, readonly, copy) NSString *destinationID;
+@property (nonatomic, readonly) BOOL shouldSuppressRingtone;
 @end
 
 @interface TUCallCenter : NSObject
@@ -117,13 +120,17 @@ static void AMSPublishCallWaiting(void) {
     AMSLog(@"call waiting: %d", (int)waiting);
 }
 
-static BOOL AMSPublishedCallWaiting(void) {
+static uint64_t AMSNotifyState(const char *name) {
     int token;
-    uint64_t waiting = 0;
-    if (notify_register_check(kCallWaitingNotify, &token) != NOTIFY_STATUS_OK) return NO;
-    notify_get_state(token, &waiting);
+    uint64_t state = 0;
+    if (notify_register_check(name, &token) != NOTIFY_STATUS_OK) return 0;
+    notify_get_state(token, &state);
     notify_cancel(token);
-    return waiting != 0;
+    return state;
+}
+
+static BOOL AMSPublishedCallWaiting(void) {
+    return AMSNotifyState(kCallWaitingNotify) != 0;
 }
 
 // --- Screen-off / locked auto-answer -----------------------------------------
@@ -147,6 +154,35 @@ static TUCall *AMSRingingCall(void) {
     for (TUCall *c in AMSCallCenter().currentCalls)
         if (!c.isOutgoing && c.status == kCallRinging) return c;
     return nil;
+}
+
+// --- Ring diagnostics ----------------------------------------------------------
+// A missing call bar always comes down to "who silenced this call?". Record, per
+// ringing call, everything that can: iOS (a Focus, a suppressed ringtone) and
+// AnsweringMachine (its "should silence" state, set when it diverts a caller the
+// Focus would block, and the two flags that make it drop the call banner).
+static BOOL gRingDiagLogged = NO;
+
+static void AMSLogRingDiagnostics(NSString *when) {
+    TUCall *call = AMSRingingCall();
+    if (!call) return;
+    AMCenter *center = AMSCenter();
+    BOOL suppressed = NO;
+    @try { if ([call respondsToSelector:@selector(shouldSuppressRingtone)]) suppressed = call.shouldSuppressRingtone; } @catch (__unused NSException *e) {}
+    AMSLog(@"ring diag %@: focus=%d ringtoneSuppressed=%d amSilence=%llu amAutoAnswered=%d amAutoAnswering=%d locked=%d", when,
+           [center respondsToSelector:@selector(DNDState)] ? (int)[center DNDState] : -1, suppressed,
+           AMSNotifyState(AM_NOTIFY("shouldSilenceChanged")),
+           [center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered],
+           [center respondsToSelector:@selector(autoAnswering)] && [center autoAnswering],
+           AMSLocked());
+}
+
+static void AMSMaybeLogRingDiagnostics(void) {
+    if (gRingDiagLogged || !AMSRingingCall()) return;
+    gRingDiagLogged = YES;
+    AMSLogRingDiagnostics(@"at ring");
+    // Again once the hooks in the call daemon and SpringBoard have settled.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ AMSLogRingDiagnostics(@"+3s"); });
 }
 
 static BOOL gForceScheduled = NO;
@@ -346,6 +382,7 @@ static NSString *AMSString(id value) {
 @property (nonatomic) BOOL listening;
 @property (nonatomic) BOOL hiddenByUser;   // chevron tapped; re-show via AM's status bar tap
 @property (nonatomic) BOOL handedOff;      // Talk/Hang up tapped; never re-show for this call
+@property (nonatomic) BOOL ignoreAMFlag;   // AM's callAutoAnswered was already set at ring time: stale
 + (instancetype)shared;
 - (void)evaluate;
 @end
@@ -386,7 +423,15 @@ static NSString *AMSString(id value) {
     }
     if (AMSCallWaiting() && !self.armed) return;
     AMCenter *center = AMSCenter();
-    BOOL amAnswered = self.armed || ([center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered]);
+    BOOL amFlag = [center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered];
+    // AM sets that flag about 2s into a call it answered. Already set while the call
+    // is still only ringing means it was left over from an earlier call: ignore it
+    // for this call, or the screening screen would appear when you answer yourself.
+    if (amFlag && !self.armed && !self.ignoreAMFlag && AMSRingingCall() && !AMSAnsweredIncomingCall()) {
+        AMSLog(@"ignoring stale callAutoAnswered flag: the call is still ringing");
+        self.ignoreAMFlag = YES;
+    }
+    BOOL amAnswered = self.armed || (amFlag && !self.ignoreAMFlag);
     if (amAnswered && !self.armed) {
         AMSLog(@"AMCenter reports callAutoAnswered");
         self.armed = YES;
@@ -467,6 +512,7 @@ static NSString *AMSString(id value) {
     self.listening = NO;
     self.hiddenByUser = NO;
     self.handedOff = NO;
+    self.ignoreAMFlag = NO;
     self.answeredAt = nil;
 }
 
@@ -572,10 +618,23 @@ static BOOL gIsSpringBoard;
     %orig;
     dispatch_async(dispatch_get_main_queue(), ^{
         AMSPublishCallWaiting();
-        if (!AMSAnyLiveCall()) gForceScheduled = NO;
+        if (!AMSAnyLiveCall()) { gForceScheduled = NO; gRingDiagLogged = NO; }
         AMSMaybeForceAnswerWhenLocked();
         [[AMSController shared] evaluate];
     });
+}
+
+// AM polls this every 0.5s after answering and, once the call is 2s old, marks it
+// auto-answered (which makes AM drop incoming-call banners). It only checks that
+// the call still exists while the call is younger than 2s, so hanging up right
+// after that leaves the mark set with no call, hiding the next call's bar.
+- (void)checkForCallStartup:(TUCall *)call {
+    int status = [call respondsToSelector:@selector(status)] ? call.status : 0;
+    if (status == kCallDisconnecting || status == kCallDisconnected || !AMSAnyLiveCall()) {
+        AMSLog(@"-[AMCenter checkForCallStartup:] skipped: the call has already ended");
+        return;
+    }
+    %orig;
 }
 
 - (void)listenToCaller:(id)sender {
@@ -649,7 +708,8 @@ static void AMSObserve(const char *name, CFNotificationCallback cb) {
             for (TUCall *c in AMSCallCenter().currentCalls)
                 if (!c.isOutgoing) AMSLog(@"call status=%@ locked=%d", AMSStatusName(c.status), AMSLocked());
             AMSPublishCallWaiting();
-            if (!AMSAnyLiveCall()) gForceScheduled = NO;
+            if (!AMSAnyLiveCall()) { gForceScheduled = NO; gRingDiagLogged = NO; }
+            AMSMaybeLogRingDiagnostics();
             AMSMaybeForceAnswerWhenLocked();
             [[AMSController shared] evaluate];
         }];

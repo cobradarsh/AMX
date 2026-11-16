@@ -58,3 +58,29 @@ greeting delay, e.g. 12 s). The screen should appear.
 Every step is logged to `/var/mobile/Library/Logs/AMScreen.log`. If something
 doesn't work, send that file. It shows whether AM's hooks fired
 (`-[AMCenter autoAnswerCall]`, `listenToCaller:` ...) and what the buttons did.
+
+On a **roothide** jailbreak an SSH session sees the jailbreak's own file tree, and
+the real system files are under `/rootfs`. So over SSH the log is at
+`/rootfs/var/mobile/Library/Logs/AMScreen.log` (in Filza it is at the plain path).
+
+### When the call bar is missing
+
+AnsweringMachine hides the incoming-call bar on purpose in two situations, and
+each ringing call logs a `ring diag` line that tells them apart:
+
+```
+ring diag at ring: focus=1 ringtoneSuppressed=1 amSilence=1 amAutoAnswered=0 amAutoAnswering=0 locked=0
+```
+
+- `focus=1` with `amSilence=1` / `ringtoneSuppressed=1`: a Focus (Do Not Disturb)
+  would have blocked this caller, and AM's **Use on "Do Not Disturb"** switch let
+  the call through silently for the machine to answer. No ring and no call bar is
+  the intended result. To see such calls, allow them in the Focus (Settings >
+  Focus > People > Allow Calls From) or turn the Focus off; turning AM's switch
+  off instead leaves them fully silenced by iOS.
+- `amAutoAnswered=1` or `amAutoAnswering=1` while the call is only ringing: AM
+  still believes it is handling an earlier call, and drops the banner. AM marks a
+  call auto-answered from a poll that only checks the call still exists during
+  its first 2 seconds, so hanging up right after that left the mark behind.
+  AMScreen now skips that poll once the call has ended, and ignores a mark that
+  is already set at ring time.
