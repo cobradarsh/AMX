@@ -11,10 +11,15 @@
 // -[AMCenter autoAnswerCall] answers unconditionally; AM applies its own rules
 // (on/off switch, Excluded Numbers) only when deciding whether to schedule it.
 // Our fallback triggers it directly, so it has to apply those rules itself.
+//
+// We also keep InCallService's call UI from getting stuck: see "In-call UI
+// recovery" below.
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <notify.h>
+#import <signal.h>
+#import <errno.h>
 #import "AMSScreenWindow.h"
 
 #define AM_NOTIFY(name) "net.limneos.answeringmachine." name
@@ -55,6 +60,28 @@ static const char *const kCallWaitingNotify = "com.personal.amscreen.callwaiting
 + (instancetype)sharedInstance;
 - (NSArray<TUCall *> *)currentCalls;
 - (void)disconnectCall:(TUCall *)call;
+@end
+
+@interface SBApplicationProcessState : NSObject
+@property (nonatomic, readonly) int pid;
+@end
+
+@interface SBApplication : NSObject
+@property (nonatomic, readonly) SBApplicationProcessState *processState;
+@end
+
+@interface SBApplicationController : NSObject
++ (instancetype)sharedInstance;
+- (SBApplication *)applicationWithBundleIdentifier:(NSString *)bundleIdentifier;
+@end
+
+@interface FBSSystemService : NSObject
++ (instancetype)sharedService;
+- (void)terminateApplication:(NSString *)bundleIdentifier forReason:(long long)reason andReport:(BOOL)report withDescription:(NSString *)description;
+@end
+
+@interface SBInCallPresentationManager : NSObject
+- (void)inCallPresentationRequestServer:(id)server clientWithIdentifier:(id)client requestsPresentationWithConfiguration:(id)configuration completion:(id)completion;
 @end
 
 // TUCallStatus values.
@@ -162,6 +189,8 @@ static TUCall *AMSRingingCall(void) {
 // AnsweringMachine (its "should silence" state, set when it diverts a caller the
 // Focus would block, and the two flags that make it drop the call banner).
 static BOOL gRingDiagLogged = NO;
+// InCallService asked SpringBoard to present its UI during the current call.
+static BOOL gUIRequested = NO;
 
 static void AMSLogRingDiagnostics(NSString *when) {
     TUCall *call = AMSRingingCall();
@@ -169,8 +198,8 @@ static void AMSLogRingDiagnostics(NSString *when) {
     AMCenter *center = AMSCenter();
     BOOL suppressed = NO;
     @try { if ([call respondsToSelector:@selector(shouldSuppressRingtone)]) suppressed = call.shouldSuppressRingtone; } @catch (__unused NSException *e) {}
-    AMSLog(@"ring diag %@: focus=%d ringtoneSuppressed=%d amSilence=%llu amAutoAnswered=%d amAutoAnswering=%d locked=%d", when,
-           [center respondsToSelector:@selector(DNDState)] ? (int)[center DNDState] : -1, suppressed,
+    AMSLog(@"ring diag %@: uiRequested=%d focus=%d ringtoneSuppressed=%d amSilence=%llu amAutoAnswered=%d amAutoAnswering=%d locked=%d", when,
+           gUIRequested, [center respondsToSelector:@selector(DNDState)] ? (int)[center DNDState] : -1, suppressed,
            AMSNotifyState(AM_NOTIFY("shouldSilenceChanged")),
            [center respondsToSelector:@selector(callAutoAnswered)] && [center callAutoAnswered],
            [center respondsToSelector:@selector(autoAnswering)] && [center autoAnswering],
@@ -371,6 +400,75 @@ static BOOL AMSAnyLiveCall(void) {
 
 static NSString *AMSString(id value) {
     return [value isKindOfClass:NSString.class] && [value length] ? value : nil;
+}
+
+// --- In-call UI recovery ---------------------------------------------------
+// InCallService asks SpringBoard to present the call UI for each incoming call
+// (-[SBInCallPresentationManager ...requestsPresentationWithConfiguration:completion:]).
+// CallHider (up to 1.7.0) suppresses that request for a hidden caller by
+// answering "presented" without presenting anything. InCallService then believes
+// its UI is on screen and never asks again, so every later call, hidden or not,
+// rings with no call bar (only the Dynamic Island) until InCallService restarts.
+//
+// So: note whether each call's UI was requested and, once no call is live,
+// restart InCallService if the call that just ended was hidden by CallHider or
+// never had its UI requested. InCallService is only the call UI process; it is
+// relaunched for the next call.
+static BOOL gCallRang = NO, gCallHidden = NO, gCallWaitingSeen = NO;
+
+static pid_t AMSInCallServicePID(void) {
+    @try {
+        SBApplicationController *controller = [(id)objc_getClass("SBApplicationController") sharedInstance];
+        if (![controller respondsToSelector:@selector(applicationWithBundleIdentifier:)]) return 0;
+        SBApplication *app = [controller applicationWithBundleIdentifier:@"com.apple.InCallService"];
+        SBApplicationProcessState *state = [app respondsToSelector:@selector(processState)] ? app.processState : nil;
+        return [state respondsToSelector:@selector(pid)] ? state.pid : 0;
+    } @catch (__unused NSException *e) {
+        return 0;
+    }
+}
+
+static void AMSResetInCallUI(NSString *reason) {
+    // Let the ended call finish tearing down, and never touch a call in progress.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (AMSAnyLiveCall()) {
+            AMSLog(@"in-call UI reset skipped (%@): another call is live", reason);
+            return;
+        }
+        pid_t pid = AMSInCallServicePID();
+        if (pid <= 0) {
+            AMSLog(@"in-call UI reset not needed (%@): InCallService is not running", reason);
+            return;
+        }
+        if (kill(pid, SIGKILL) == 0) {
+            AMSLog(@"in-call UI reset (%@): restarted InCallService, pid %d", reason, pid);
+            return;
+        }
+        int err = errno;
+        FBSSystemService *service = [(id)objc_getClass("FBSSystemService") sharedService];
+        if ([service respondsToSelector:@selector(terminateApplication:forReason:andReport:withDescription:)]) {
+            [service terminateApplication:@"com.apple.InCallService" forReason:1 andReport:NO withDescription:@"AMScreen: resetting the in-call UI"];
+            AMSLog(@"in-call UI reset (%@): kill failed (errno %d), asked FrontBoard to terminate InCallService", reason, err);
+        } else {
+            AMSLog(@"in-call UI reset FAILED (%@): kill errno %d and FrontBoard terminate unavailable", reason, err);
+        }
+    });
+}
+
+// Called on every call status change in SpringBoard.
+static void AMSTrackInCallUI(void) {
+    TUCall *ringing = AMSRingingCall();
+    if (ringing) {
+        gCallRang = YES;
+        if (AMSCallWaiting()) gCallWaitingSeen = YES;   // the UI may already be up for the other call
+        if (AMSCallHiddenByCallHider(ringing)) gCallHidden = YES;
+    }
+    if (AMSAnyLiveCall()) return;
+    if (gCallRang) {
+        if (gCallHidden) AMSResetInCallUI(@"CallHider hid that call's UI");
+        else if (!gUIRequested && !gCallWaitingSeen) AMSResetInCallUI(@"that call's UI was never requested");
+    }
+    gCallRang = gCallHidden = gCallWaitingSeen = gUIRequested = NO;
 }
 
 @interface AMSController : NSObject <AMSScreenDelegate>
@@ -656,6 +754,23 @@ static BOOL gIsSpringBoard;
 
 %end
 
+// SpringBoard only: notes each request InCallService makes to present the call UI.
+// Installed after every tweak's constructor has run, so it wraps CallHider's hook
+// on the same method and sees the request before CallHider can swallow it.
+%group AMInCallUI
+
+%hook SBInCallPresentationManager
+
+- (void)inCallPresentationRequestServer:(id)server clientWithIdentifier:(id)client requestsPresentationWithConfiguration:(id)configuration completion:(id)completion {
+    gUIRequested = YES;
+    AMSLog(@"in-call UI presentation requested");
+    %orig;
+}
+
+%end
+
+%end
+
 #pragma mark Darwin notifications posted by AnsweringMachine (any process)
 
 static void AMSOnAutoAnswered(CFNotificationCenterRef c, void *o, CFStringRef name, const void *obj, CFDictionaryRef info) {
@@ -710,6 +825,7 @@ static void AMSObserve(const char *name, CFNotificationCallback cb) {
             AMSPublishCallWaiting();
             if (!AMSAnyLiveCall()) { gForceScheduled = NO; gRingDiagLogged = NO; }
             AMSMaybeLogRingDiagnostics();
+            AMSTrackInCallUI();
             AMSMaybeForceAnswerWhenLocked();
             [[AMSController shared] evaluate];
         }];
@@ -717,6 +833,15 @@ static void AMSObserve(const char *name, CFNotificationCallback cb) {
 
     // Tweaks load alphabetically, so AnsweringMachineUI.dylib may not be loaded yet.
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (gIsSpringBoard) {
+            Class manager = objc_getClass("SBInCallPresentationManager");
+            if ([manager instancesRespondToSelector:@selector(inCallPresentationRequestServer:clientWithIdentifier:requestsPresentationWithConfiguration:completion:)]) {
+                %init(AMInCallUI);
+                AMSLog(@"watching in-call UI presentation requests");
+            } else {
+                AMSLog(@"in-call UI presentation hook unavailable on this iOS");
+            }
+        }
         if (!objc_getClass("AMCenter")) {
             if (gIsSpringBoard) AMSLog(@"AMCenter not found - is AnsweringMachine XS installed and enabled?");
             return;

@@ -65,13 +65,24 @@ the real system files are under `/rootfs`. So over SSH the log is at
 
 ### When the call bar is missing
 
-AnsweringMachine hides the incoming-call bar on purpose in two situations, and
-each ringing call logs a `ring diag` line that tells them apart:
+Each ringing call logs a `ring diag` line (at ring and again 3 s later) that
+tells the possible causes apart:
 
 ```
-ring diag at ring: focus=1 ringtoneSuppressed=1 amSilence=1 amAutoAnswered=0 amAutoAnswering=0 locked=0
+ring diag +3s: uiRequested=0 focus=0 ringtoneSuppressed=0 amSilence=0 amAutoAnswered=0 amAutoAnswering=0 locked=0
 ```
 
+- `uiRequested=0`: **InCallService never asked SpringBoard to present the call
+  UI.** This was the cause of calls ringing with only the Dynamic Island showing.
+  CallHider (up to 1.7.0) suppresses that request for a hidden caller by replying
+  "presented" (`completion(nil)`) without presenting anything, so InCallService
+  believes its UI is on screen and never asks again, for any caller, until it is
+  restarted. CallHider's own log shows it: `PRES-HOOK suppressed` once, then no
+  `PRES-HOOK` line for any later call. AMScreen notes each presentation request
+  and, once no call is live, restarts InCallService if the call that just ended
+  was hidden by CallHider or never had its UI requested (`in-call UI reset ...`
+  in the log). The proper fix is in CallHider: do not report success for a
+  presentation that did not happen.
 - `focus=1` with `amSilence=1` / `ringtoneSuppressed=1`: a Focus (Do Not Disturb)
   would have blocked this caller, and AM's **Use on "Do Not Disturb"** switch let
   the call through silently for the machine to answer. No ring and no call bar is
